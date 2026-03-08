@@ -14,6 +14,8 @@ All generated configs live under `/opt/dnstun-ezpz` on the host.
 
 The script **must be run as root**.
 
+**راهنمای استفاده به فارسی:** [GUIDE_FA.md](GUIDE_FA.md)
+
 ---
 
 ## 1. First-time deployment (create cluster)
