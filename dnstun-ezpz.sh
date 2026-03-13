@@ -5,7 +5,7 @@ set -e
 # Variables
 # ===========================
 BASE_DIR="/opt/dnstun-ezpz"
-DNSTUN_VERSION="v0.2.0"
+DNSTUN_VERSION="v0.3.0"
 CONFIG_FILE="$BASE_DIR/dnstun.conf"
 DNS_LB_YML="$BASE_DIR/dns-lb.yml"
 DOCKER_COMPOSE_YML="$BASE_DIR/docker-compose.yml"
@@ -48,20 +48,20 @@ init_basedir() {
 # Install required packages
 # ===========================
 install_packages() {
-  if which jq xxd >/dev/null 2>&1; then
+  if which jq xxd qrencode >/dev/null 2>&1; then
     return 0
   fi
   if which apt >/dev/null 2>&1; then
     apt update
-    DEBIAN_FRONTEND=noninteractive apt install -y jq xxd
+    DEBIAN_FRONTEND=noninteractive apt install -y jq xxd qrencode
     return 0
   fi
   if which yum >/dev/null 2>&1; then
     yum makecache
-    yum install -y jq xxd
+    yum install -y jq xxd qrencode
     return 0
   fi
-  echo "Error: Could not install jq and xxd. This script requires apt (Debian/Ubuntu) or yum (RHEL/CentOS). Install them manually and rerun." >&2
+  echo "Error: Could not install jq, xxd, and qrencode. This script requires apt (Debian/Ubuntu) or yum (RHEL/CentOS). Install them manually and rerun." >&2
   exit 1
 }
 
@@ -278,6 +278,35 @@ load_join_config() {
   fi
 }
 
+generate_slipnet_uri() {
+  local transport="$1" protocol="$2" domain="$3" pubkey="$4"
+  local auth_user="$5" auth_pass="$6" profile_name="$7"
+
+  local tunnel_type
+  case "${transport}_${protocol}" in
+    dnstt_ssh)        tunnel_type="dnstt_ssh" ;;
+    dnstt_socks)      tunnel_type="dnstt" ;;
+    slipstream_ssh)   tunnel_type="slipstream_ssh" ;;
+    slipstream_socks) tunnel_type="ss" ;;
+  esac
+
+  local ssh_enabled="0" ssh_user="" ssh_pass=""
+  if [[ "$protocol" == "ssh" ]]; then
+    ssh_enabled="1"
+    ssh_user="$auth_user"
+    ssh_pass="$auth_pass"
+  fi
+
+  # v17 pipe-delimited format (38 fields, positions 0-37)
+  local fields="17|${tunnel_type}|${profile_name}|${domain}"
+  fields+="|8.8.8.8:53:0|0|5000|bbr|1080|127.0.0.1|0"
+  fields+="|${pubkey}|${auth_user}|${auth_pass}"
+  fields+="|${ssh_enabled}|${ssh_user}|${ssh_pass}|22|0|127.0.0.1"
+  fields+="|0||udp|password||||0|443|||0||0|0||0|"
+
+  printf '%s' "slipnet://$(printf '%s' "$fields" | base64 -w 0)"
+}
+
 print_current_config() {
   local base_domain="${DOMAINS[0]#*.}"
   echo
@@ -298,6 +327,13 @@ print_current_config() {
     if [[ "$transport" == "dnstt" ]]; then
       echo "public_key: $PUBKEY"
     fi
+    local slipnet_uri
+    slipnet_uri=$(generate_slipnet_uri "$transport" "$protocol" "$domain" "${PUBKEY:-}" "$AUTH_USER" "$AUTH_PASS" "${transport}-${protocol} (${domain})")
+    echo
+    echo "SlipNet URI:"
+    echo "$slipnet_uri"
+    echo
+    qrencode -t UTF8 <<< "$slipnet_uri"
     echo "---"
   done
   echo
