@@ -480,15 +480,25 @@ load_initial_config() {
         SERVER_ID="$existing_server_id"
       fi
     fi
-    while true; do
-      read -rp "Enter this server's ID (1-255)${SERVER_ID:+ [$SERVER_ID]}: " SERVER_ID_INPUT
-      candidate="${SERVER_ID_INPUT:-$SERVER_ID}"
+    if [[ "$DNSTUN_NONINTERACTIVE" == "1" ]]; then
+      candidate="${DNSTUN_SERVER_ID:-$SERVER_ID}"
       if [[ "$candidate" =~ ^[0-9]+$ ]] && [[ "$candidate" -ge 1 ]] && [[ "$candidate" -le 255 ]]; then
         SERVER_ID="$candidate"
-        break
+      else
+        echo "Error: DNSTUN_SERVER_ID must be 1-255 in non-interactive mode (got: '${DNSTUN_SERVER_ID:-}')." >&2
+        exit 1
       fi
-      echo "Invalid. Server ID must be between 1 and 255." >&2
-    done
+    else
+      while true; do
+        read -rp "Enter this server's ID (1-255)${SERVER_ID:+ [$SERVER_ID]}: " SERVER_ID_INPUT
+        candidate="${SERVER_ID_INPUT:-$SERVER_ID}"
+        if [[ "$candidate" =~ ^[0-9]+$ ]] && [[ "$candidate" -ge 1 ]] && [[ "$candidate" -le 255 ]]; then
+          SERVER_ID="$candidate"
+          break
+        fi
+        echo "Invalid. Server ID must be between 1 and 255." >&2
+      done
+    fi
     JOIN_MODE=1
     ACTION=2
   elif [ -f "$CONFIG_FILE" ]; then
@@ -523,9 +533,163 @@ load_initial_config() {
 }
 
 # ===========================
+# Non-interactive config loader (env-var driven)
+# ===========================
+load_noninteractive_config() {
+  OLD_AUTH_USER="${AUTH_USER:-}"
+
+  # SERVER_ID
+  local candidate="${DNSTUN_SERVER_ID:-}"
+  if [[ -z "$candidate" ]]; then
+    echo "Error: DNSTUN_SERVER_ID is required in non-interactive mode." >&2; exit 1
+  fi
+  if [[ ! "$candidate" =~ ^[0-9]+$ ]] || [[ "$candidate" -lt 1 ]] || [[ "$candidate" -gt 255 ]]; then
+    echo "Error: DNSTUN_SERVER_ID must be between 1 and 255 (got: '$candidate')." >&2; exit 1
+  fi
+  SERVER_ID="$candidate"
+
+  # PREFIX
+  PREFIX="${DNSTUN_PREFIX:-${PREFIX:-s}}"
+  if [[ "${#PREFIX}" -lt 1 ]] || [[ "${#PREFIX}" -gt 63 ]] || [[ ! "$PREFIX" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+    echo "Error: DNSTUN_PREFIX='$PREFIX' is invalid. Use 1-63 chars: letters, digits, hyphens (not at start or end)." >&2; exit 1
+  fi
+
+  # NUM_SERVERS
+  NUM_SERVERS="${DNSTUN_NUM_SERVERS:-${NUM_SERVERS:-3}}"
+  if [[ ! "$NUM_SERVERS" =~ ^[0-9]+$ ]] || [[ "$NUM_SERVERS" -lt 1 ]] || [[ "$NUM_SERVERS" -gt 255 ]]; then
+    echo "Error: DNSTUN_NUM_SERVERS must be between 1 and 255 (got: '$NUM_SERVERS')." >&2; exit 1
+  fi
+
+  # AUTH_USER
+  AUTH_USER="${DNSTUN_AUTH_USER:-${AUTH_USER:-vpnuser}}"
+  if [[ "${#AUTH_USER}" -lt 1 ]] || [[ "${#AUTH_USER}" -gt 32 ]] || [[ ! "$AUTH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "Error: DNSTUN_AUTH_USER='$AUTH_USER' is invalid. Use 1-32 chars: start with letter/underscore, then letters/digits/underscore/hyphen." >&2; exit 1
+  fi
+
+  # AUTH_PASS
+  AUTH_PASS="${DNSTUN_AUTH_PASS:-${AUTH_PASS:-}}"
+  if [[ -z "$AUTH_PASS" ]]; then
+    echo "Error: DNSTUN_AUTH_PASS is required in non-interactive mode." >&2; exit 1
+  fi
+  if [[ "$AUTH_PASS" == *'"'* || "$AUTH_PASS" == *'\\'* ]]; then
+    echo "Error: DNSTUN_AUTH_PASS must not contain double-quote or backslash." >&2; exit 1
+  fi
+
+  # DOMAINS / TRANSPORTS / PROTOCOLS (comma-separated, parallel)
+  local raw_domains="${DNSTUN_DOMAINS:-}"
+  local raw_transports="${DNSTUN_TRANSPORTS:-}"
+  local raw_protocols="${DNSTUN_PROTOCOLS:-}"
+  if [[ -z "$raw_domains" ]]; then
+    echo "Error: DNSTUN_DOMAINS is required in non-interactive mode." >&2; exit 1
+  fi
+
+  IFS=',' read -ra DOMAIN_ARR <<< "$raw_domains"
+  IFS=',' read -ra TRANSPORT_ARR <<< "$raw_transports"
+  IFS=',' read -ra PROTOCOL_ARR <<< "$raw_protocols"
+
+  local num_d=${#DOMAIN_ARR[@]}
+  if [[ "${#TRANSPORT_ARR[@]}" -ne "$num_d" ]]; then
+    echo "Error: DNSTUN_TRANSPORTS count (${#TRANSPORT_ARR[@]}) must match DNSTUN_DOMAINS count ($num_d)." >&2; exit 1
+  fi
+  if [[ "${#PROTOCOL_ARR[@]}" -ne "$num_d" ]]; then
+    echo "Error: DNSTUN_PROTOCOLS count (${#PROTOCOL_ARR[@]}) must match DNSTUN_DOMAINS count ($num_d)." >&2; exit 1
+  fi
+
+  DOMAINS=()
+  TRANSPORTS=()
+  PROTOCOLS=()
+  for ((i=0;i<num_d;i++)); do
+    local d; d="${DOMAIN_ARR[$i]}"
+    d="${d// /}"
+    if [[ "${#d}" -lt 1 ]] || [[ "${#d}" -gt 253 ]] || \
+       [[ "$d" == .* ]] || [[ "$d" == *. ]] || [[ "$d" == *..* ]] || \
+       [[ ! "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?[.])*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+      echo "Error: Invalid domain name '$d' in DNSTUN_DOMAINS (index $i)." >&2; exit 1
+    fi
+    DOMAINS+=("$d")
+
+    local t; t="${TRANSPORT_ARR[$i]}"
+    t="${t// /}"
+    t="${t,,}"
+    if [[ "$t" != "dnstt" && "$t" != "slipstream" ]]; then
+      echo "Error: Invalid transport '$t' for domain '$d'. Must be 'dnstt' or 'slipstream'." >&2; exit 1
+    fi
+    TRANSPORTS+=("$t")
+
+    local p; p="${PROTOCOL_ARR[$i]}"
+    p="${p// /}"
+    p="${p,,}"
+    if [[ "$p" != "ssh" && "$p" != "socks" ]]; then
+      echo "Error: Invalid protocol '$p' for domain '$d'. Must be 'ssh' or 'socks'." >&2; exit 1
+    fi
+    PROTOCOLS+=("$p")
+  done
+
+  # DNSTT private key
+  local need_dnstt_key=0
+  for t in "${TRANSPORTS[@]}"; do [[ "$t" == "dnstt" ]] && need_dnstt_key=1; done
+  if [[ $need_dnstt_key -eq 1 ]]; then
+    if [[ -n "${DNSTUN_PRIVKEY:-}" ]]; then
+      PRIVKEY="${DNSTUN_PRIVKEY// /}"
+      if [[ ! "$PRIVKEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Error: DNSTUN_PRIVKEY must be exactly 64 hex characters." >&2; exit 1
+      fi
+      derive_pubkey
+      if [[ -z "$PUBKEY" || ! "$PUBKEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Error: DNSTUN_PRIVKEY could not derive a valid public key." >&2; exit 1
+      fi
+    elif [[ -z "$PRIVKEY" ]]; then
+      echo "Generating transport key (DNSTT)..."
+      KEYS=$(docker run --rm $DNSTT_SERVER_IMAGE -gen-key)
+      PRIVKEY=$(echo "$KEYS" | grep 'privkey' | awk '{print $2}')
+      derive_pubkey
+    else
+      derive_pubkey  # keep existing key from loaded config
+    fi
+  fi
+}
+
+# ===========================
 # Interactive menu and reconfigure prompts
 # ===========================
 run_menu_or_reconfigure() {
+  # Non-interactive mode: bypass all interactive prompts
+  if [[ "$DNSTUN_NONINTERACTIVE" == "1" ]]; then
+    if [[ $JOIN_MODE -ne 0 ]]; then
+      return 0
+    fi
+    if [ "${CONFIG_EXISTS:-0}" -eq 1 ]; then
+      local ni_action="${DNSTUN_ACTION:-reconfigure}"
+      case "$ni_action" in
+        print)
+          print_current_config; exit 0 ;;
+        start)
+          echo "Starting services..."
+          $DOCKER_CMD -f "$DOCKER_COMPOSE_YML" up -d --remove-orphans; exit 0 ;;
+        stop)
+          echo "Stopping services..."
+          $DOCKER_CMD -f "$DOCKER_COMPOSE_YML" stop; exit 0 ;;
+        restart)
+          echo "Restarting services..."
+          $DOCKER_CMD -f "$DOCKER_COMPOSE_YML" down --remove-orphans
+          $DOCKER_CMD -f "$DOCKER_COMPOSE_YML" up -d --remove-orphans; exit 0 ;;
+        uninstall)
+          echo "Uninstalling cluster..."
+          $DOCKER_CMD -f "$DOCKER_COMPOSE_YML" down -v --remove-orphans || true
+          if [ -f "$WARP_ACCOUNT_TOML" ]; then warp_delete_account "$WARP_ACCOUNT_TOML"; fi
+          if id "$AUTH_USER" >/dev/null 2>&1; then userdel "$AUTH_USER" || true; fi
+          rm -f "$SSHD_CONF"
+          rm -rf "$BASE_DIR"
+          echo "Cluster uninstalled."; exit 0 ;;
+        reconfigure) ;; # fall through to load_noninteractive_config
+        *)
+          echo "Error: Unknown DNSTUN_ACTION='$ni_action'. Valid values: reconfigure, print, start, stop, restart, uninstall." >&2; exit 1 ;;
+      esac
+    fi
+    load_noninteractive_config
+    return 0
+  fi
+
   if [[ $JOIN_MODE -ne 0 ]]; then
     return 0
   fi
